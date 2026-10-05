@@ -3,9 +3,6 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include "driver/gpio.h"
-#include "driver/rtc_io.h"
-#include "esp_sleep.h"
 #include <time.h>
 
 #if __has_include("secrets.h")
@@ -16,22 +13,22 @@
 
 // Set to true when running inside Wokwi simulator********
 // Set to false when flashing to real ESP32 hardware**********
-#define IS_SIMULATION true
+#define IS_SIMULATION false
 
 // --- Pin Definitions ---
 const int TRIG_PIN = 5;
 const int ECHO_PIN = 18;
 const int STATUS_LED_PIN = 2;
 const int CALIBRATION_BUTTON_PIN = 4;
+const int BUILTIN_BOOT_BUTTON_PIN = 0;
 
 // --- Physical Drain Configuration ---
 const float DEFAULT_DRAIN_DEPTH_MM = 4000.0;
 float drainDepthMM = DEFAULT_DRAIN_DEPTH_MM;
 Preferences preferences;
 
-// --- Power Saving Sleep Configuration ---
-#define TIME_TO_SLEEP_SEC 5 
-#define uS_TO_S_FACTOR 1000000ULL
+// --- Measurement Interval ---
+#define TIME_TO_SLEEP_SEC 5
 
 // --- Filtering Configuration ---
 const int FILTER_WINDOW_SIZE = 5;
@@ -47,13 +44,27 @@ RTC_DATA_ATTR uint8_t heartbeatSamplesSince = 0;
 RTC_DATA_ATTR uint8_t lastNotifiedAlertState = 0;
 
 enum class AlertState { NORMAL, SURGE, OVERFLOW };
-AlertState alertState = AlertState::NORMAL;
+volatile AlertState alertState = AlertState::NORMAL;
 unsigned long lastMeasurementMs = 0;
 bool calibrationButtonWasPressed = false;
+volatile uint8_t calibrationButtonPressPending = 0;
+volatile bool calibrationConfirmationActive = false;
+volatile uint32_t measurementPulseUntilMs = 0;
+bool buttonPinLevelsInitialized = false;
+bool previousCalibrationButtonHigh = true;
+bool previousBootButtonHigh = true;
 float measureRawDistanceMM();
 
 // Surge Threshold (mm/sec rise rate)
 const float SURGE_THRESHOLD_MM_S = 10.0;
+
+void IRAM_ATTR onExternalCalibrationButtonPress() {
+  calibrationButtonPressPending |= 0x01;
+}
+
+void IRAM_ATTR onBuiltinBootButtonPress() {
+  calibrationButtonPressPending |= 0x02;
+}
 
 void beginWiFiConnection() {
   if (IS_SIMULATION) {
@@ -191,7 +202,7 @@ void notifyTelegramOnAlert(const String& status, float waterLevelMM, float rateO
   }
   if (currentState == lastNotifiedAlertState) return;
 
-  String message = "Galano Galano!!! Flood alert: ";
+  String message = " Duwapiyaw!Galano Galano!!! Flood alert: ";
   message += status;
   message += "\nTime (UTC): ";
   message += currentTimestampUtc();
@@ -227,6 +238,9 @@ void resetWaterLevelFilter() {
 
 void calibrateDrainDepth() {
   float measuredDepthMM = measureRawDistanceMM();
+  Serial.print("Calibration sensor distance: ");
+  Serial.print(measuredDepthMM);
+  Serial.println(" mm");
   if (measuredDepthMM <= 0 || measuredDepthMM > 6800.0) {
     printTimestamp();
     Serial.println("Calibration failed: invalid sensor distance.");
@@ -240,15 +254,24 @@ void calibrateDrainDepth() {
   }
 
   size_t bytesWritten = preferences.putFloat("depth_mm", measuredDepthMM);
+  float savedDepthMM = preferences.getFloat("depth_mm", DEFAULT_DRAIN_DEPTH_MM);
   preferences.end();
-  if (bytesWritten != sizeof(float)) {
+  if (bytesWritten != sizeof(float) || savedDepthMM != measuredDepthMM) {
     printTimestamp();
     Serial.println("Calibration failed: could not save drain depth.");
     return;
   }
 
-  drainDepthMM = measuredDepthMM;
+  drainDepthMM = savedDepthMM;
   resetWaterLevelFilter();
+  calibrationConfirmationActive = true;
+  for (int blink = 0; blink < 3; blink++) {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+    delay(150);
+    digitalWrite(STATUS_LED_PIN, LOW);
+    delay(150);
+  }
+  calibrationConfirmationActive = false;
   printTimestamp();
   Serial.print("Drain depth calibrated and saved: ");
   Serial.print(drainDepthMM);
@@ -256,11 +279,47 @@ void calibrateDrainDepth() {
 }
 
 void handleCalibrationButton() {
-  bool buttonPressed = digitalRead(CALIBRATION_BUTTON_PIN) == LOW;
-  if (buttonPressed && !calibrationButtonWasPressed) {
+  noInterrupts();
+  uint8_t pendingButtons = calibrationButtonPressPending;
+  calibrationButtonPressPending = false;
+  interrupts();
+
+  bool calibrationButtonHigh = digitalRead(CALIBRATION_BUTTON_PIN) == HIGH;
+  bool bootButtonHigh = digitalRead(BUILTIN_BOOT_BUTTON_PIN) == HIGH;
+  if (!buttonPinLevelsInitialized) {
+    Serial.print("Button input levels at startup: GPIO4=");
+    Serial.print(calibrationButtonHigh ? "HIGH" : "LOW");
+    Serial.print(", GPIO0=");
+    Serial.println(bootButtonHigh ? "HIGH" : "LOW");
+    previousCalibrationButtonHigh = calibrationButtonHigh;
+    previousBootButtonHigh = bootButtonHigh;
+    buttonPinLevelsInitialized = true;
+  } else {
+    if (calibrationButtonHigh != previousCalibrationButtonHigh) {
+      Serial.print("GPIO4 changed to ");
+      Serial.println(calibrationButtonHigh ? "HIGH" : "LOW");
+      previousCalibrationButtonHigh = calibrationButtonHigh;
+    }
+    if (bootButtonHigh != previousBootButtonHigh) {
+      Serial.print("GPIO0 changed to ");
+      Serial.println(bootButtonHigh ? "HIGH" : "LOW");
+      previousBootButtonHigh = bootButtonHigh;
+    }
+  }
+
+  bool buttonPressed = !calibrationButtonHigh || !bootButtonHigh;
+  if ((pendingButtons != 0 || buttonPressed) && !calibrationButtonWasPressed) {
+    calibrationButtonWasPressed = true;
+    if (pendingButtons & 0x01 || !calibrationButtonHigh) {
+      Serial.println("Calibration button event detected on GPIO4.");
+    }
+    if (pendingButtons & 0x02 || !bootButtonHigh) {
+      Serial.println("Calibration button event detected on GPIO0.");
+    }
     delay(30);
-    if (digitalRead(CALIBRATION_BUTTON_PIN) == LOW) {
-      calibrationButtonWasPressed = true;
+    if (pendingButtons != 0 ||
+        digitalRead(CALIBRATION_BUTTON_PIN) == LOW ||
+        digitalRead(BUILTIN_BOOT_BUTTON_PIN) == LOW) {
       calibrateDrainDepth();
     }
   } else if (!buttonPressed) {
@@ -268,48 +327,35 @@ void handleCalibrationButton() {
   }
 }
 
-void updateStatusIndicator() {
-  unsigned long elapsedMs = millis();
-  bool ledOn = false;
+void statusIndicatorTask(void*) {
+  while (true) {
+    if (!calibrationConfirmationActive) {
+      uint32_t elapsedMs = millis();
+      bool ledOn = false;
 
-  switch (alertState) {
-    case AlertState::SURGE:
-      ledOn = (elapsedMs % 1000UL) < 500UL;
-      break;
-    case AlertState::OVERFLOW:
-      ledOn = true;
-      break;
-    case AlertState::NORMAL:
-      ledOn = (elapsedMs % 30000UL) < 1000UL;
-      break;
+      switch (alertState) {
+        case AlertState::SURGE:
+          ledOn = (elapsedMs % 1000UL) < 500UL;
+          break;
+        case AlertState::OVERFLOW:
+          ledOn = true;
+          break;
+        case AlertState::NORMAL:
+          ledOn = (static_cast<int32_t>(measurementPulseUntilMs - elapsedMs) > 0) ||
+                  (elapsedMs % 30000UL) < 1000UL;
+          break;
+      }
+
+      digitalWrite(STATUS_LED_PIN, ledOn ? HIGH : LOW);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
-
-  digitalWrite(STATUS_LED_PIN, ledOn ? HIGH : LOW);
 }
 
-void enterDeepSleep() {
-  if (alertState == AlertState::SURGE) {
-    return;
+void blinkMeasurementIndicator() {
+  if (alertState == AlertState::NORMAL) {
+    measurementPulseUntilMs = millis() + 120UL;
   }
-
-  if (alertState == AlertState::NORMAL && heartbeatSamplesSince >= 6) {
-    digitalWrite(STATUS_LED_PIN, HIGH);
-    delay(1000);
-    digitalWrite(STATUS_LED_PIN, LOW);
-    heartbeatSamplesSince = 0;
-  } else {
-    digitalWrite(STATUS_LED_PIN, alertState == AlertState::OVERFLOW ? HIGH : LOW);
-  }
-
-  gpio_hold_en((gpio_num_t)STATUS_LED_PIN);
-  gpio_deep_sleep_hold_en();
-  Serial.println("Entering deep sleep...");
-  Serial.flush();
-  esp_sleep_enable_timer_wakeup((uint64_t)TIME_TO_SLEEP_SEC * uS_TO_S_FACTOR);
-  rtc_gpio_pulldown_dis((gpio_num_t)CALIBRATION_BUTTON_PIN);
-  rtc_gpio_pullup_en((gpio_num_t)CALIBRATION_BUTTON_PIN);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)CALIBRATION_BUTTON_PIN, 0);
-  esp_deep_sleep_start();
 }
 
 float measureRawDistanceMM() {
@@ -372,6 +418,7 @@ void processDrainMeasurement() {
     } else {
       alertState = AlertState::NORMAL;
     }
+    blinkMeasurementIndicator();
 
     if (heartbeatSamplesSince < 6) heartbeatSamplesSince++;
 
@@ -393,56 +440,53 @@ void processDrainMeasurement() {
 
 void setup() {
   Serial.begin(115200);
-  loadDrainDepth();
-  if (time(nullptr) < 1700000000 && !synchronizeClock()) {
-    Serial.println("NTP time sync failed; calendar timestamps will be unavailable.");
-  }
-
-  // Configure pins and guarantee default idle state
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(STATUS_LED_PIN, OUTPUT);
   pinMode(CALIBRATION_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUILTIN_BOOT_BUTTON_PIN, INPUT_PULLUP);
   digitalWrite(TRIG_PIN, LOW);
+  attachInterrupt(digitalPinToInterrupt(CALIBRATION_BUTTON_PIN), onExternalCalibrationButtonPress, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BUILTIN_BOOT_BUTTON_PIN), onBuiltinBootButtonPress, FALLING);
+
+  Serial.println("Status LED test on GPIO 2: three flashes.");
+  for (int blink = 0; blink < 3; blink++) {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+    delay(150);
+    digitalWrite(STATUS_LED_PIN, LOW);
+    delay(150);
+  }
+
+  BaseType_t ledTaskResult = xTaskCreatePinnedToCore(
+      statusIndicatorTask, "status-led", 3072, nullptr, 2, nullptr, 0);
+  Serial.println(ledTaskResult == pdPASS ? "Status LED task started." : "ERROR: status LED task failed to start.");
+
+  loadDrainDepth();
+  Serial.print("Loaded drain depth: ");
+  Serial.print(drainDepthMM);
+  Serial.println(" mm");
+  if (time(nullptr) < 1700000000 && !synchronizeClock()) {
+    Serial.println("NTP time sync failed; calendar timestamps will be unavailable.");
+  }
 
   if (IS_SIMULATION) {
     Serial.println("Simulation Mode Initialized.");
     lastMeasurementMs = millis() - (TIME_TO_SLEEP_SEC * 1000UL);
   } else {
-    // Hardware deep sleep execution flow
-    Serial.println("\n=== Node Wakeup ===");
-    gpio_deep_sleep_hold_dis();
-    gpio_hold_dis((gpio_num_t)STATUS_LED_PIN);
-    
-    // Allow sensor line voltage and transducer to stabilize after wake
-    delay(50); 
-
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
-      delay(30);
-      calibrateDrainDepth();
-      while (digitalRead(CALIBRATION_BUTTON_PIN) == LOW) delay(10);
-    } else {
-      processDrainMeasurement();
-    }
+    Serial.println("Hardware mode: staying awake; use GPIO 4 button or board BOOT button (GPIO 0) to calibrate.");
+    delay(50);
+    handleCalibrationButton();
+    processDrainMeasurement();
     lastMeasurementMs = millis();
-    enterDeepSleep();
   }
 }
 
 void loop() {
-  updateStatusIndicator();
   handleCalibrationButton();
 
-  if (IS_SIMULATION) {
-    if (millis() - lastMeasurementMs >= TIME_TO_SLEEP_SEC * 1000UL) {
-      lastMeasurementMs = millis();
-      processDrainMeasurement();
-    }
-  } else if (alertState == AlertState::SURGE &&
-             millis() - lastMeasurementMs >= TIME_TO_SLEEP_SEC * 1000UL) {
+  if (millis() - lastMeasurementMs >= TIME_TO_SLEEP_SEC * 1000UL) {
     lastMeasurementMs = millis();
     processDrainMeasurement();
-    enterDeepSleep();
   }
 
   delay(10);
