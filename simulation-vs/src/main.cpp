@@ -202,7 +202,8 @@ void notifyTelegramOnAlert(const String& status, float waterLevelMM, float rateO
   }
   if (currentState == lastNotifiedAlertState) return;
 
-  String message = " Duwapiyaw!Galano Galano!!! Flood alert: ";
+  String message = "FLOOD RISK DETECTED: ";
+  message += "\nStatus: ";
   message += status;
   message += "\nTime (UTC): ";
   message += currentTimestampUtc();
@@ -341,8 +342,7 @@ void statusIndicatorTask(void*) {
           ledOn = true;
           break;
         case AlertState::NORMAL:
-          ledOn = (static_cast<int32_t>(measurementPulseUntilMs - elapsedMs) > 0) ||
-                  (elapsedMs % 30000UL) < 1000UL;
+          ledOn = static_cast<int32_t>(measurementPulseUntilMs - elapsedMs) > 0;
           break;
       }
 
